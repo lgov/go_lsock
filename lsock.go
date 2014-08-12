@@ -131,8 +131,6 @@ type nstat_msg_src_description struct {
 	// u_int8_t  data[];
 }
 
-/*****************************************************************************/
-
 // The original C structures are #pragma pack(1), but here this isn't important,
 // we let binary.Read map packed byte stream to unpacked go struct.
 type nstat_counts struct {
@@ -156,6 +154,15 @@ type nstat_msg_src_counts struct {
 	Counts nstat_counts
 }
 
+type Descriptor struct {
+	zzz    string
+	Counts nstat_counts
+}
+
+var descriptors map[uint32]*Descriptor
+
+/*****************************************************************************/
+
 /* Process the response we received from the system socket. */
 func process_nstat_msg(msg_hdr nstat_msg_hdr, buf []byte) error {
 
@@ -169,6 +176,7 @@ func process_nstat_msg(msg_hdr nstat_msg_hdr, buf []byte) error {
 			break
 		}
 		fmt.Println("new source: ", msg)
+		descriptors[msg.SrcRef] = &Descriptor{}
 
 	case NSTAT_MSG_TYPE_SRC_REMOVED:
 		var msg nstat_msg_src_removed
@@ -179,6 +187,7 @@ func process_nstat_msg(msg_hdr nstat_msg_hdr, buf []byte) error {
 			break
 		}
 		fmt.Println("source removed: ", msg)
+		delete(descriptors, msg.SrcRef)
 
 	case NSTAT_MSG_TYPE_SRC_DESC:
 		var msg nstat_msg_src_description
@@ -205,6 +214,7 @@ func process_nstat_msg(msg_hdr nstat_msg_hdr, buf []byte) error {
 			break
 		}
 		fmt.Println("counts received: ", msg)
+		descriptors[msg.SrcRef].Counts = msg.Counts
 
 	}
 	return nil
@@ -223,13 +233,15 @@ func main() {
 		panic(err)
 	}
 
+	descriptors = make(map[uint32]*Descriptor)
+
 	var state = STATE_INITIAL
 	for {
 		// Subscribe to following events one by one:
 		// 1. all TCP events
 		// 2. all UDP events
-		// 3. XXXXXXX
-		//
+		// 3. counts
+		// 4. descriptions
 		switch state {
 		case STATE_INITIAL:
 			addAllSources(conn, NSTAT_PROVIDER_TCP)
@@ -250,6 +262,9 @@ func main() {
 		} else {
 			var msg_hdr nstat_msg_hdr
 
+			// we received a message. first read the header, based on the
+			// HType field we can the decide how to interpret the complete
+			// byte stream.
 			reader := bytes.NewReader(buf)
 			err := binary.Read(reader, binary.LittleEndian, &msg_hdr)
 			if err != nil {
