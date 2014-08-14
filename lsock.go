@@ -19,6 +19,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"github.com/aschepis/kernctl"
+	"io"
 )
 
 const (
@@ -154,6 +155,98 @@ type nstat_msg_src_counts struct {
 	Counts nstat_counts
 }
 
+const (
+	AF_INET  = 2
+	AF_INET6 = 30
+)
+
+type in6_addr struct {
+	S6_addr [16]uint8
+}
+
+type sockaddr_in6 struct {
+	Sin6_len      uint8
+	Sin6_family   uint8
+	Sin6_port     uint16
+	Sin6_flowinfo uint32
+	Sin6_addr     [16]uint8
+	Sin6_scope_id uint32
+}
+
+/* From netinet/in.h:
+   struct sockaddr_in {
+       __uint8_t       sin_len;
+       sa_family_t     sin_family;
+       in_port_t       sin_port;
+       struct  in_addr sin_addr;
+       char            sin_zero[8];
+   };
+*/
+type sockaddr_in4 struct {
+	Sin_len    uint8
+	Sin_family uint8
+	Sin_port   uint16
+	Sin_addr   [4]uint8
+	Sin_zero   [8]byte
+}
+
+type nstat_tcp_descriptor struct {
+	/*	short            sin_family   // e.g. AF_INET
+		unsigned short   sin_port    // e.g. htons(3490)
+		struct in_addr   sin_addr     // see struct in_addr, below
+		char             sin_zero[8]  // zero this if you want to
+	*/
+	/*        union
+	          {
+	                  struct sockaddr_in      v4
+	                  struct sockaddr_in6     v6
+	          } local
+
+	          union
+	          {
+	                  struct sockaddr_in      v4
+	                  struct sockaddr_in6     v6
+	          } remote
+	*/
+	Local      [28]byte
+	Remote     [28]byte
+	Ifindex    uint32
+	State      uint32
+	Sndbufsize uint32
+	Sndbufused uint32
+	Rcvbufsize uint32
+	Rcvbufused uint32
+	Txunacked  uint32
+	Txwindow   uint32
+	Txcwindow  uint32
+	Upid       uint64
+	Pid        uint32
+	Pname      [64]uint8
+}
+
+// Read the sockaddr structures in network byte order!
+func (d *nstat_tcp_descriptor) Local4() (sockaddr_in4, error) {
+	var addr sockaddr_in4
+	var tmp []byte
+	tmp = d.Local[0:16]
+	reader := bytes.NewReader(tmp)
+	err := binary.Read(reader, binary.BigEndian, &addr)
+	return addr, err
+}
+
+func (d *nstat_tcp_descriptor) Remote4() (sockaddr_in4, error) {
+	var addr sockaddr_in4
+	var tmp []byte
+	tmp = d.Remote[0:16]
+	reader := bytes.NewReader(tmp)
+	err := binary.Read(reader, binary.BigEndian, &addr)
+	return addr, err
+}
+
+func (d *nstat_tcp_descriptor) Family() uint8 {
+	return uint8(d.Local[1])
+}
+
 type Descriptor struct {
 	zzz    string
 	Counts nstat_counts
@@ -162,6 +255,35 @@ type Descriptor struct {
 var descriptors map[uint32]*Descriptor
 
 /*****************************************************************************/
+
+func readTCPDescriptor(msg nstat_msg_src_description, reader io.Reader) error {
+	var tcpDesc nstat_tcp_descriptor
+
+	// Read the remainder of the data in the nstat_tcp_descriptor struct
+	err := binary.Read(reader, binary.LittleEndian, &tcpDesc)
+	if err != nil {
+		fmt.Println("binary.Read TCPDescriptor failed:", err)
+		return err
+	}
+	fmt.Println("tcp descriptor received:", tcpDesc)
+
+	fmt.Println("Family: ", tcpDesc.Family())
+	switch tcpDesc.Family() {
+	case AF_INET:
+		var laddr, raddr sockaddr_in4
+		if laddr, err = tcpDesc.Local4(); err != nil {
+			break
+		}
+		if raddr, err = tcpDesc.Remote4(); err != nil {
+			break
+		}
+		fmt.Println("local: ", laddr, " remote: ", raddr)
+	case AF_INET6:
+		break
+	}
+
+	return err
+}
 
 /* Process the response we received from the system socket. */
 func process_nstat_msg(msg_hdr nstat_msg_hdr, buf []byte) error {
@@ -172,7 +294,7 @@ func process_nstat_msg(msg_hdr nstat_msg_hdr, buf []byte) error {
 		reader := bytes.NewReader(buf)
 		err := binary.Read(reader, binary.LittleEndian, &msg)
 		if err != nil {
-			fmt.Println("binary.Read failed:", err)
+			fmt.Println("binary.Read SRC_ADDED failed:", err)
 			break
 		}
 		fmt.Println("new source: ", msg)
@@ -183,7 +305,7 @@ func process_nstat_msg(msg_hdr nstat_msg_hdr, buf []byte) error {
 		reader := bytes.NewReader(buf)
 		err := binary.Read(reader, binary.LittleEndian, &msg)
 		if err != nil {
-			fmt.Println("binary.Read failed:", err)
+			fmt.Println("binary.Read SRC_REMOVED failed:", err)
 			break
 		}
 		fmt.Println("source removed: ", msg)
@@ -194,14 +316,16 @@ func process_nstat_msg(msg_hdr nstat_msg_hdr, buf []byte) error {
 		reader := bytes.NewReader(buf)
 		err := binary.Read(reader, binary.LittleEndian, &msg)
 		if err != nil {
-			fmt.Println("binary.Read src_description failed:", err)
+			fmt.Println("binary.Read SRC_DESCRIPTION failed:", err)
 			break
 		}
 		switch msg.Provider {
 		case NSTAT_PROVIDER_TCP:
-			fmt.Println("TCP description received: ", msg)
+			fmt.Println("buf: ", buf)
+			readTCPDescriptor(msg, reader)
+			fmt.Println("TCP descriptor received: ", msg)
 		case NSTAT_PROVIDER_UDP:
-			fmt.Println("UDP description received: ", msg)
+			fmt.Println("UDP descriptor received: ", msg)
 		}
 		fmt.Println("description received: ", msg)
 
@@ -210,7 +334,7 @@ func process_nstat_msg(msg_hdr nstat_msg_hdr, buf []byte) error {
 		reader := bytes.NewReader(buf)
 		err := binary.Read(reader, binary.LittleEndian, &msg)
 		if err != nil {
-			fmt.Println("binary.Read failed:", err)
+			fmt.Println("binary.Read SRC_COUNTS failed:", err)
 			break
 		}
 		fmt.Println("counts received: ", msg)
@@ -269,7 +393,8 @@ func main() {
 			err := binary.Read(reader, binary.LittleEndian, &msg_hdr)
 			if err != nil {
 				fmt.Println("binary.Read failed:", err)
-				break
+				//				break
+				continue
 			}
 			fmt.Println("msg_hdr recvd:", msg_hdr)
 
@@ -278,6 +403,7 @@ func main() {
 				{
 					/* Previous requested action was successful, go to next. */
 					state++
+					fmt.Println("state: ", state, "success context ", msg_hdr.Context)
 				}
 			case NSTAT_MSG_TYPE_SRC_ADDED, NSTAT_MSG_TYPE_SRC_REMOVED,
 				NSTAT_MSG_TYPE_SRC_DESC, NSTAT_MSG_TYPE_SRC_COUNTS:
@@ -287,8 +413,9 @@ func main() {
 						break
 					}
 				}
+			case NSTAT_MSG_TYPE_ERROR:
+				fmt.Println("error")
 			}
-
 		}
 	}
 
