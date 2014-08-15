@@ -20,6 +20,9 @@ import (
 	"fmt"
 	"github.com/aschepis/kernctl"
 	"io"
+	//	"io/ioutil"
+	"log"
+	"time"
 )
 
 const (
@@ -47,6 +50,23 @@ const (
 
 	NSTAT_SRC_REF_ALL     = 0xFFFFFFFF
 	NSTAT_SRC_REF_INVALID = 0
+)
+
+const (
+	TCPS_CLOSED       = 0 /* closed */
+	TCPS_LISTEN       = 1 /* listening for connection */
+	TCPS_SYN_SENT     = 2 /* active, have sent syn */
+	TCPS_SYN_RECEIVED = 3 /* have send and received syn */
+	/* states < TCPS_ESTABLISHED are those where connections not established */
+	TCPS_ESTABLISHED = 4 /* established */
+	TCPS_CLOSE_WAIT  = 5 /* rcvd fin, waiting for close */
+	/* states > TCPS_CLOSE_WAIT are those where user has closed */
+	TCPS_FIN_WAIT_1 = 6 /* have closed, sent fin */
+	TCPS_CLOSING    = 7 /* closed xchd FIN; await FIN ACK */
+	TCPS_LAST_ACK   = 8 /* had fin and close; await FIN ACK */
+	/* states > TCPS_CLOSE_WAIT && < TCPS_FIN_WAIT_2 await ACK of FIN */
+	TCPS_FIN_WAIT_2 = 9  /* have closed, fin is acked */
+	TCPS_TIME_WAIT  = 10 /* in 2*msl quiet wait after close */
 )
 
 type nstat_msg_hdr struct {
@@ -87,6 +107,9 @@ type nstat_msg_get_src_description struct {
 	SrcRef uint32
 }
 
+/*****************************************************************************/
+/* COMMANDS                                                                  */
+/*****************************************************************************/
 func addAllSources(conn *kernctl.Conn, provider uint32) {
 	aasreq := &nstat_msg_add_all_srcs{
 		Hdr: nstat_msg_hdr{
@@ -95,7 +118,7 @@ func addAllSources(conn *kernctl.Conn, provider uint32) {
 		},
 		Provider: provider,
 	}
-	fmt.Println("addAllSources", provider)
+	log.Println("addAllSources", provider)
 	conn.SendCommand(aasreq)
 }
 
@@ -107,7 +130,19 @@ func getCounts(conn *kernctl.Conn, srcRef uint32) {
 		},
 		SrcRef: srcRef,
 	}
-	fmt.Println("getCounts", srcRef)
+	log.Println("getCounts", srcRef)
+	conn.SendCommand(qsreq)
+}
+
+func getSrcDescription(conn *kernctl.Conn, srcRef uint32) {
+	qsreq := &nstat_msg_query_src_req{
+		Hdr: nstat_msg_hdr{
+			HType:   NSTAT_MSG_TYPE_GET_SRC_DESC,
+			Context: 1005,
+		},
+		SrcRef: srcRef,
+	}
+	log.Println("getSrcDescription", srcRef)
 	conn.SendCommand(qsreq)
 }
 
@@ -150,9 +185,10 @@ type nstat_counts struct {
 }
 
 type nstat_msg_src_counts struct {
-	Hdr    nstat_msg_hdr
-	SrcRef uint32
-	Counts nstat_counts
+	Hdr     nstat_msg_hdr
+	SrcRef  uint32
+	Counts  nstat_counts
+	TCPDesc nstat_tcp_descriptor
 }
 
 const (
@@ -173,15 +209,6 @@ type sockaddr_in6 struct {
 	Sin6_scope_id uint32
 }
 
-/* From netinet/in.h:
-   struct sockaddr_in {
-       __uint8_t       sin_len;
-       sa_family_t     sin_family;
-       in_port_t       sin_port;
-       struct  in_addr sin_addr;
-       char            sin_zero[8];
-   };
-*/
 type sockaddr_in4 struct {
 	Sin_len    uint8
 	Sin_family uint8
@@ -190,26 +217,15 @@ type sockaddr_in4 struct {
 	Sin_zero   [8]byte
 }
 
-type nstat_tcp_descriptor struct {
-	/*	short            sin_family   // e.g. AF_INET
-		unsigned short   sin_port    // e.g. htons(3490)
-		struct in_addr   sin_addr     // see struct in_addr, below
-		char             sin_zero[8]  // zero this if you want to
-	*/
-	/*        union
-	          {
-	                  struct sockaddr_in      v4
-	                  struct sockaddr_in6     v6
-	          } local
+func (s *sockaddr_in4) String() string {
+	return fmt.Sprintf("%d.%d.%d.%d:%d", s.Sin_addr[0], s.Sin_addr[1],
+		s.Sin_addr[2], s.Sin_addr[3], s.Sin_port)
+}
 
-	          union
-	          {
-	                  struct sockaddr_in      v4
-	                  struct sockaddr_in6     v6
-	          } remote
-	*/
-	Local      [28]byte
-	Remote     [28]byte
+// TODO: account for differences in OS X 8-10
+type nstat_tcp_descriptor struct {
+	Local      [28]byte // local IP address and port
+	Remote     [28]byte // Remote IP address and port
 	Ifindex    uint32
 	State      uint32
 	Sndbufsize uint32
@@ -219,9 +235,13 @@ type nstat_tcp_descriptor struct {
 	Txunacked  uint32
 	Txwindow   uint32
 	Txcwindow  uint32
-	Upid       uint64
-	Pid        uint32
-	Pname      [64]uint8
+
+	// This was added in 10_8, pushing the rest by four bytes
+	Traffic_class uint32
+
+	Upid  uint64
+	Pid   uint32
+	Pname [64]byte
 }
 
 // Read the sockaddr structures in network byte order!
@@ -247,27 +267,62 @@ func (d *nstat_tcp_descriptor) Family() uint8 {
 	return uint8(d.Local[1])
 }
 
+func (d *nstat_tcp_descriptor) Name() string {
+	n := bytes.Index(d.Pname[:], []byte{0})
+	return string(d.Pname[:n])
+}
+
+func (d *nstat_tcp_descriptor) StateString() string {
+	switch d.State {
+	case TCPS_CLOSED:
+		return ("CLOSED")
+	case TCPS_LISTEN:
+		return ("LISTENING")
+	case TCPS_ESTABLISHED:
+		return ("ESTABLISHED")
+	case TCPS_CLOSING:
+		return ("CLOSING")
+	case TCPS_SYN_SENT:
+		return ("SYN_SENT")
+	case TCPS_LAST_ACK:
+		return ("LAST_ACK")
+	case TCPS_CLOSE_WAIT:
+		return ("CLOSE_WAIT")
+	case TCPS_TIME_WAIT:
+		return ("TIME_WAIT")
+	case TCPS_FIN_WAIT_1:
+		return ("FIN_WAIT_1")
+	case TCPS_FIN_WAIT_2:
+		return ("FIN_WAIT_2")
+
+	default:
+		return ("?")
+	}
+}
+
 type Descriptor struct {
-	zzz    string
-	Counts nstat_counts
+	zzz     string
+	Counts  nstat_counts
+	TCPDesc *nstat_tcp_descriptor
 }
 
 var descriptors map[uint32]*Descriptor
 
 /*****************************************************************************/
 
-func readTCPDescriptor(msg nstat_msg_src_description, reader io.Reader) error {
+func readTCPDescriptor(msg nstat_msg_src_description,
+	reader io.Reader) (*nstat_tcp_descriptor, error) {
+
 	var tcpDesc nstat_tcp_descriptor
 
 	// Read the remainder of the data in the nstat_tcp_descriptor struct
 	err := binary.Read(reader, binary.LittleEndian, &tcpDesc)
 	if err != nil {
-		fmt.Println("binary.Read TCPDescriptor failed:", err)
-		return err
+		log.Println("binary.Read TCPDescriptor failed:", err)
+		return nil, err
 	}
-	fmt.Println("tcp descriptor received:", tcpDesc)
+	log.Println("tcp descriptor received:", tcpDesc)
 
-	fmt.Println("Family: ", tcpDesc.Family())
 	switch tcpDesc.Family() {
 	case AF_INET:
 		var laddr, raddr sockaddr_in4
@@ -277,71 +332,77 @@ func readTCPDescriptor(msg nstat_msg_src_description, reader io.Reader) error {
 		if raddr, err = tcpDesc.Remote4(); err != nil {
 			break
 		}
-		fmt.Println("local: ", laddr, " remote: ", raddr)
+
+		log.Println("local: ", laddr, " remote: ", raddr)
 	case AF_INET6:
 		break
 	}
 
-	return err
+	return &tcpDesc, err
 }
 
 /* Process the response we received from the system socket. */
-func process_nstat_msg(msg_hdr nstat_msg_hdr, buf []byte) error {
+func process_nstat_msg(conn *kernctl.Conn, msg_hdr nstat_msg_hdr, buf []byte) error {
+
+	err := error(nil)
 
 	switch msg_hdr.HType {
 	case NSTAT_MSG_TYPE_SRC_ADDED:
 		var msg nstat_msg_src_added
 		reader := bytes.NewReader(buf)
-		err := binary.Read(reader, binary.LittleEndian, &msg)
+		err = binary.Read(reader, binary.LittleEndian, &msg)
 		if err != nil {
-			fmt.Println("binary.Read SRC_ADDED failed:", err)
+			log.Println("binary.Read SRC_ADDED failed:", err)
 			break
 		}
-		fmt.Println("new source: ", msg)
+		log.Println("new source: ", msg)
 		descriptors[msg.SrcRef] = &Descriptor{}
+		/* New source added, now get its details */
+		getSrcDescription(conn, msg.SrcRef)
 
 	case NSTAT_MSG_TYPE_SRC_REMOVED:
 		var msg nstat_msg_src_removed
 		reader := bytes.NewReader(buf)
-		err := binary.Read(reader, binary.LittleEndian, &msg)
+		err = binary.Read(reader, binary.LittleEndian, &msg)
 		if err != nil {
-			fmt.Println("binary.Read SRC_REMOVED failed:", err)
+			log.Println("binary.Read SRC_REMOVED failed:", err)
 			break
 		}
-		fmt.Println("source removed: ", msg)
+		log.Println("source removed: ", msg)
 		delete(descriptors, msg.SrcRef)
 
 	case NSTAT_MSG_TYPE_SRC_DESC:
 		var msg nstat_msg_src_description
 		reader := bytes.NewReader(buf)
-		err := binary.Read(reader, binary.LittleEndian, &msg)
+		err = binary.Read(reader, binary.LittleEndian, &msg)
 		if err != nil {
-			fmt.Println("binary.Read SRC_DESCRIPTION failed:", err)
+			log.Println("binary.Read SRC_DESCRIPTION failed:", err)
 			break
 		}
 		switch msg.Provider {
 		case NSTAT_PROVIDER_TCP:
-			fmt.Println("buf: ", buf)
-			readTCPDescriptor(msg, reader)
-			fmt.Println("TCP descriptor received: ", msg)
+			log.Println("buf: ", buf)
+			var tcpDesc *nstat_tcp_descriptor
+			tcpDesc, err = readTCPDescriptor(msg, reader)
+			descriptors[msg.SrcRef].TCPDesc = tcpDesc
+			log.Println("TCP descriptor received: ", msg)
 		case NSTAT_PROVIDER_UDP:
-			fmt.Println("UDP descriptor received: ", msg)
+			log.Println("UDP descriptor received: ", msg)
 		}
-		fmt.Println("description received: ", msg)
+		log.Println("description received: ", msg)
 
 	case NSTAT_MSG_TYPE_SRC_COUNTS:
 		var msg nstat_msg_src_counts
 		reader := bytes.NewReader(buf)
-		err := binary.Read(reader, binary.LittleEndian, &msg)
+		err = binary.Read(reader, binary.LittleEndian, &msg)
 		if err != nil {
-			fmt.Println("binary.Read SRC_COUNTS failed:", err)
+			log.Println("binary.Read SRC_COUNTS failed:", err)
 			break
 		}
-		fmt.Println("counts received: ", msg)
+		log.Println("counts received: ", msg)
 		descriptors[msg.SrcRef].Counts = msg.Counts
-
 	}
-	return nil
+	return err
 }
 
 const (
@@ -351,11 +412,40 @@ const (
 	STATE_COUNTS_ADDED = 6
 )
 
+func printDescriptors() {
+	fmt.Println("Time      PID   Name                    Local Addr              Remote Addr             If      State           RX       TX")
+	for _, desc := range descriptors {
+		fmt.Printf("%-10s", time.Now().Format("15:04:05"))
+
+		if desc.TCPDesc != nil {
+			fmt.Printf("%-6d", desc.TCPDesc.Pid)
+			fmt.Printf("%-24s", desc.TCPDesc.Name())
+			if local, err := desc.TCPDesc.Local4(); err == nil {
+				fmt.Printf("%-24s", local.String())
+			} else {
+				fmt.Printf("%-24s", " ")
+			}
+			if remote, err := desc.TCPDesc.Remote4(); err == nil {
+				fmt.Printf("%-24s", remote.String())
+			} else {
+				fmt.Printf("%-24s", " ")
+			}
+			fmt.Printf("%-8d", desc.TCPDesc.Ifindex)
+			fmt.Printf("%-16s", desc.TCPDesc.StateString())
+			fmt.Printf("%-8d", desc.Counts.Rxpackets)
+			fmt.Printf("%-8d", desc.Counts.Txpackets)
+		}
+		fmt.Println()
+	}
+}
+
 func main() {
 	conn := kernctl.NewConnByName("com.apple.network.statistics")
 	if err := conn.Connect(); err != nil {
 		panic(err)
 	}
+
+	//	log.SetOutput(ioutil.Discard)
 
 	descriptors = make(map[uint32]*Descriptor)
 
@@ -392,30 +482,32 @@ func main() {
 			reader := bytes.NewReader(buf)
 			err := binary.Read(reader, binary.LittleEndian, &msg_hdr)
 			if err != nil {
-				fmt.Println("binary.Read failed:", err)
+				log.Println("binary.Read failed:", err)
 				//				break
 				continue
 			}
-			fmt.Println("msg_hdr recvd:", msg_hdr)
+			log.Println("msg_hdr recvd:", msg_hdr)
 
 			switch msg_hdr.HType {
 			case NSTAT_MSG_TYPE_SUCCESS:
 				{
 					/* Previous requested action was successful, go to next. */
 					state++
-					fmt.Println("state: ", state, "success context ", msg_hdr.Context)
+					log.Println("state: ", state, "success context ", msg_hdr.Context)
 				}
 			case NSTAT_MSG_TYPE_SRC_ADDED, NSTAT_MSG_TYPE_SRC_REMOVED,
 				NSTAT_MSG_TYPE_SRC_DESC, NSTAT_MSG_TYPE_SRC_COUNTS:
 				{
-					ret := process_nstat_msg(msg_hdr, buf)
+					ret := process_nstat_msg(conn, msg_hdr, buf)
 					if ret != nil {
 						break
 					}
 				}
 			case NSTAT_MSG_TYPE_ERROR:
-				fmt.Println("error")
+				log.Println("error")
 			}
+
+			printDescriptors()
 		}
 	}
 
